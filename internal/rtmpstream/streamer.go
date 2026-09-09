@@ -2,51 +2,111 @@ package rtmpstream
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
 	"sync"
+	"time"
 )
 
 type Streamer struct {
-	rtmpURL    string
-	width      int
-	height     int
-	fps        int
-	cmd        *exec.Cmd
-	stdin      io.WriteCloser
-	mu         sync.Mutex
-	running    bool
-	textFile   string
+	rtmpURL  string
+	width    int
+	height   int
+	fps      int
+	textFile string
+
+	mu          sync.Mutex
+	cmd         *exec.Cmd
+	currentText string
+	procAlive   bool
+	stopped     bool
 }
 
 func New(rtmpURL string, width, height, fps int) *Streamer {
 	return &Streamer{
-		rtmpURL: rtmpURL,
-		width:   width,
-		height:  height,
-		fps:     fps,
+		rtmpURL:  rtmpURL,
+		width:    width,
+		height:   height,
+		fps:      fps,
 		textFile: "/tmp/kasion_current_text.txt",
 	}
 }
 
+// Start launches the self-healing supervisor. It never blocks: if ffmpeg dies
+// for any reason it is automatically restarted (with backoff) using the last
+// known text. Returns an error only if the initial write/process launch fails.
 func (s *Streamer) Start(initialText string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.running {
-		return fmt.Errorf("streamer already running")
+	if !s.stopped {
+		s.stopped = false
+	}
+	s.currentText = initialText
+	if err := s.writeTextLocked(initialText); err != nil {
+		return err
 	}
 
-	if err := os.WriteFile(s.textFile, []byte(wrapText(initialText, 62, 14)), 0644); err != nil {
-		return fmt.Errorf("write initial text: %w", err)
-	}
+	go s.supervise()
+	return nil
+}
 
-	// Build ffmpeg drawtext filter that reads text from the reloadable file
+// supervise is the restart loop. It blocks for the lifetime of the streamer.
+func (s *Streamer) supervise() {
+	backoff := 3 * time.Second
+	for {
+		s.mu.Lock()
+		if s.stopped {
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+
+		err := s.launch()
+		if err != nil {
+			log.Printf("streamer: failed to start ffmpeg: %v (retrying in %s)", err, backoff)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+
+		backoff = 3 * time.Second
+
+		// Wait for ffmpeg to exit.
+		s.mu.Lock()
+		cmd := s.cmd
+		s.mu.Unlock()
+
+		if cmd == nil {
+			return
+		}
+		err = cmd.Wait()
+		log.Printf("streamer: ffmpeg exited: %v", err)
+
+		s.mu.Lock()
+		s.procAlive = false
+		s.mu.Unlock()
+
+		// Pause briefly before relaunching so a fast crash-loop can't
+		// hammer the RTMP ingest.
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+		time.Sleep(backoff)
+	}
+}
+
+// launch starts a fresh ffmpeg process using the current text.
+func (s *Streamer) launch() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	fontPath := findFont()
 	filter := fmt.Sprintf(
-		"color=c=black:s=%dx%d:d=86400:r=%d,"+
+		"color=c=black:s=%dx%d:r=%d,"+
 			"drawtext=fontfile=%s"+
 			":textfile=%s"+
 			":fontcolor=white:fontsize=48"+
@@ -65,7 +125,6 @@ func (s *Streamer) Start(initialText string) error {
 		"-maxrate", "3000k",
 		"-bufsize", "1000k",
 		"-g", "60",
-		"-sc_threshold", "0",
 		"-c:a", "aac",
 		"-b:a", "128k",
 		"-ar", "44100",
@@ -74,41 +133,81 @@ func (s *Streamer) Start(initialText string) error {
 		s.rtmpURL,
 	}
 
-	s.cmd = exec.Command("ffmpeg", args...)
-	s.cmd.Stderr = os.Stderr
+	// Ensure the text file is present before ffmpeg starts.
+	if err := s.writeTextLocked(s.currentText); err != nil {
+		return err
+	}
 
-	if err := s.cmd.Start(); err != nil {
+	cmd := exec.Command("ffmpeg", args...)
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 
-	s.running = true
-	log.Printf("RTMP stream started to %s", s.rtmpURL)
+	// Stop() may have been called while we were between the stopped-check
+	// and this start. If so, kill the process immediately rather than
+	// leaving a stray ffmpeg running.
+	if s.stopped {
+		cmd.Process.Kill()
+		s.procAlive = false
+		return fmt.Errorf("start aborted: streamer stopped")
+	}
 
-	go func() {
-		if err := s.cmd.Wait(); err != nil {
-			log.Printf("ffmpeg exited: %v", err)
-		}
-		s.mu.Lock()
-		s.running = false
-		s.mu.Unlock()
-	}()
-
+	s.cmd = cmd
+	s.procAlive = true
+	log.Printf("streamer: ffmpeg started -> %s", s.rtmpURL)
 	return nil
 }
 
+// UpdateText stores the text and atomically writes it to the reloaded text
+// file. It works even if ffmpeg is momentarily down so the next restart
+// resumes with the latest message.
 func (s *Streamer) UpdateText(text string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if !s.running {
-		return fmt.Errorf("streamer not running")
-	}
+	s.currentText = text
+	return s.writeTextLocked(text)
+}
 
-	if err := os.WriteFile(s.textFile, []byte(wrapText(text, 62, 14)), 0644); err != nil {
-		return fmt.Errorf("write text file: %w", err)
+// writeTextLocked writes atomically (tmp + rename) so drawtext's reload=1
+// never reads a partially written file. Callers must hold the mutex.
+func (s *Streamer) writeTextLocked(text string) error {
+	tmp := s.textFile + ".tmp"
+	if err := os.WriteFile(tmp, []byte(wrapText(text, 62, 14)), 0644); err != nil {
+		return fmt.Errorf("write text tmp: %w", err)
 	}
-
+	if err := os.Rename(tmp, s.textFile); err != nil {
+		return fmt.Errorf("rename text file: %w", err)
+	}
 	return nil
+}
+
+func (s *Streamer) Stop() error {
+	s.mu.Lock()
+	s.stopped = true
+	var cmd *exec.Cmd
+	if s.cmd != nil && s.procAlive {
+		cmd = s.cmd
+	}
+	s.procAlive = false
+	s.mu.Unlock()
+
+	if cmd != nil && cmd.Process != nil {
+		if err := cmd.Process.Signal(os.Interrupt); err != nil {
+			cmd.Process.Kill()
+		}
+	}
+	log.Printf("RTMP stream stopped")
+	return nil
+}
+
+// IsRunning reports whether an ffmpeg process is currently alive.
+func (s *Streamer) IsRunning() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.procAlive
 }
 
 // findFont locates an available TrueType font on the system.
@@ -192,27 +291,4 @@ func joinLines(lines []string) string {
 		out += l
 	}
 	return out
-}
-
-func (s *Streamer) Stop() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.running || s.cmd == nil {
-		return nil
-	}
-
-	if err := s.cmd.Process.Signal(os.Interrupt); err != nil {
-		s.cmd.Process.Kill()
-	}
-
-	s.running = false
-	log.Printf("RTMP stream stopped")
-	return nil
-}
-
-func (s *Streamer) IsRunning() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.running
 }
